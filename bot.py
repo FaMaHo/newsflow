@@ -14,6 +14,7 @@ Setup:
 
 import asyncio
 import logging
+import os
 import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional
@@ -40,10 +41,28 @@ logging.basicConfig(
 )
 log = logging.getLogger("newsbot")
 
+# ── Railway deployment: restore session from environment variable ─────────────
+_session_b64 = os.environ.get("SESSION_BASE64", "")
+_data_dir = os.environ.get("DATA_DIR", ".")
+if _session_b64:
+    import base64 as _b64
+    import gzip as _gzip
+    os.makedirs(_data_dir, exist_ok=True)
+    _session_path = os.path.join(_data_dir, "newsbot.session")
+    if not os.path.exists(_session_path):
+        _decoded = _b64.b64decode(_session_b64)
+        # Handle both compressed and uncompressed session files
+        try:
+            _decoded = _gzip.decompress(_decoded)
+        except Exception:
+            pass  # not compressed, use as-is
+        with open(_session_path, "wb") as _f:
+            _f.write(_decoded)
+
 
 # ── Global instances ──────────────────────────────────────────────────────────
 
-db = Database("newsbot.db")
+db = Database(os.path.join(os.environ.get("DATA_DIR", "."), "newsbot.db"))
 ai = AIEngine(OLLAMA_URL, OLLAMA_MODEL)
 telegram_bot: Optional[Bot] = None
 
@@ -56,7 +75,8 @@ async def start_channel_listener():
     On first run this will ask for your phone number and a login code.
     The session is saved to 'newsbot.session' so you only log in once.
     """
-    client = TelegramClient("newsbot", API_ID, API_HASH)
+    data_dir = os.environ.get("DATA_DIR", ".")
+    client = TelegramClient(os.path.join(data_dir, "newsbot"), API_ID, API_HASH)
     await client.start()
     log.info("Telethon client started — monitoring %d channels", len(SOURCE_CHANNELS))
 
