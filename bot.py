@@ -28,7 +28,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from config import (
     API_ID, API_HASH, BOT_TOKEN,
     OUTPUT_CHANNEL_ID, SOURCE_CHANNELS,
-    OLLAMA_MODEL, OLLAMA_URL,
+    GROQ_API_KEY, GROQ_MODEL,
     DIGEST_HOUR, DIGEST_MINUTE,
     MAX_POSTS_FOR_ANALYSIS
 )
@@ -63,7 +63,7 @@ if _session_b64:
 # ── Global instances ──────────────────────────────────────────────────────────
 
 db = Database(os.path.join(os.environ.get("DATA_DIR", "."), "newsbot.db"))
-ai = AIEngine(OLLAMA_URL, OLLAMA_MODEL)
+ai = AIEngine(GROQ_API_KEY, GROQ_MODEL)
 telegram_bot: Optional[Bot] = None
 
 

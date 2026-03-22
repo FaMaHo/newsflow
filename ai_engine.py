@@ -1,56 +1,54 @@
 """
-AI Engine — uses Ollama (free, local) for summarization and analysis.
-If Ollama is not running, falls back to simple extractive summarization (no AI needed).
+AI Engine — uses Groq (free cloud API) for summarization and analysis.
+Falls back to extractive summarization if GROQ_API_KEY is not set.
 """
 
 import re
 import heapq
 import logging
-import aiohttp
 from collections import Counter
+
+from groq import AsyncGroq
 
 log = logging.getLogger("newsbot.ai")
 
 
 class AIEngine:
-    def __init__(self, ollama_url: str, model: str):
-        self.ollama_url = ollama_url.rstrip("/")
+    def __init__(self, groq_api_key: str, model: str):
         self.model = model
+        self._client = AsyncGroq(api_key=groq_api_key) if groq_api_key else None
 
-    # ── Ollama helpers ────────────────────────────────────────────────────────
+    # ── Groq helpers ──────────────────────────────────────────────────────────
 
     async def ping(self) -> bool:
-        """Check if Ollama is running."""
+        """Check if Groq is configured and reachable."""
+        if not self._client:
+            return False
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{self.ollama_url}/api/tags", timeout=aiohttp.ClientTimeout(total=3)) as r:
-                    return r.status == 200
+            await self._client.models.list()
+            return True
         except Exception:
             return False
 
     async def _ask(self, prompt: str, system: str = "") -> str:
-        """Send a prompt to Ollama and return the response text."""
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "system": system,
-            "stream": False,
-        }
+        """Send a prompt to Groq and return the response text."""
+        if not self._client:
+            return ""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.ollama_url}/api/generate",
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        return data.get("response", "").strip()
-                    else:
-                        log.warning("Ollama returned status %d", r.status)
-                        return ""
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+
+            response = await self._client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=1024,
+                temperature=0.5,
+            )
+            return response.choices[0].message.content.strip()
         except Exception as e:
-            log.warning("Ollama unavailable: %s", e)
+            log.warning("Groq request failed: %s", e)
             return ""
 
     # ── Public methods ────────────────────────────────────────────────────────
@@ -75,8 +73,7 @@ class AIEngine:
         if result:
             return result
 
-        # Fallback: extractive summarization
-        log.info("Using extractive fallback for summarize()")
+        log.info("Groq unavailable — using extractive fallback for summarize()")
         return _extractive_summary(posts, n_sentences=8)
 
     async def analyze_coverage(self, by_channel: dict[str, list[dict]], topic: str | None) -> str:
@@ -107,8 +104,7 @@ class AIEngine:
         if result:
             return result
 
-        # Fallback: keyword comparison
-        log.info("Using extractive fallback for analyze_coverage()")
+        log.info("Groq unavailable — using extractive fallback for analyze_coverage()")
         return _extractive_comparison(by_channel)
 
     async def daily_digest(self, posts: list[dict]) -> str:
@@ -132,7 +128,7 @@ class AIEngine:
         if result:
             return result
 
-        log.info("Using extractive fallback for daily_digest()")
+        log.info("Groq unavailable — using extractive fallback for daily_digest()")
         return _extractive_summary(posts, n_sentences=10)
 
 
@@ -149,33 +145,25 @@ def _sentences(text: str) -> list[str]:
 
 
 def _extractive_summary(posts: list[dict], n_sentences: int = 8) -> str:
-    """
-    Pick the most 'important' sentences using TF-IDF-style word frequency scoring.
-    No AI required.
-    """
     all_text = " ".join(_clean(p["text"]) for p in posts)
     sents = _sentences(all_text)
     if not sents:
         return "No content to summarize."
 
-    # Word frequency
     words = re.findall(r"\b[a-zA-Z]{4,}\b", all_text.lower())
     freq = Counter(words)
 
-    # Score each sentence
     def score(s):
         ws = re.findall(r"\b[a-zA-Z]{4,}\b", s.lower())
         return sum(freq[w] for w in ws) / max(len(ws), 1)
 
     top = heapq.nlargest(n_sentences, sents, key=score)
-    # Restore original order
     ordered = [s for s in sents if s in set(top)][:n_sentences]
     bullets = "\n".join(f"• {s}" for s in ordered)
     return f"<i>(AI offline — extractive summary)</i>\n\n{bullets}"
 
 
 def _extractive_comparison(by_channel: dict[str, list[dict]]) -> str:
-    """Simple keyword-diff comparison when Ollama is offline."""
     lines = ["<i>(AI offline — keyword comparison)</i>\n"]
     channel_words: dict[str, Counter] = {}
     for channel, posts in by_channel.items():
@@ -191,7 +179,6 @@ def _extractive_comparison(by_channel: dict[str, list[dict]]) -> str:
 
 
 def _format_posts_for_prompt(posts: list[dict], max_chars: int = 6000) -> str:
-    """Format posts for inclusion in a prompt, trimmed to max_chars."""
     parts = []
     total = 0
     for p in posts:
