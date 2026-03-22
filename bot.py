@@ -142,9 +142,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 <b>Monitored channels:</b>\n"]
-    stats = db.channel_stats()
+    stats = db.channel_stats_by_username()
     for ch in SOURCE_CHANNELS:
-        count = stats.get(str(ch), 0)
+        ch = ch.strip()
+        count = stats.get(ch.lower(), 0)
         lines.append(f"  • <code>{ch}</code> — {count} posts stored")
     await update.message.reply_text("\n".join(lines), parse_mode=constants.ParseMode.HTML)
 
@@ -152,7 +153,7 @@ async def cmd_channels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total = db.total_posts()
     ai_ok = await ai.ping()
-    ai_status = f"✅ Ollama ({OLLAMA_MODEL})" if ai_ok else "⚠️ Ollama offline — using extractive fallback"
+    ai_status = f"✅ Groq ({GROQ_MODEL})" if ai_ok else "⚠️ Groq offline — using extractive fallback"
     msg = (
         f"🤖 <b>Bot status</b>\n\n"
         f"Posts in database: <b>{total}</b>\n"

@@ -37,6 +37,13 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_channel ON posts(channel_id)")
             conn.commit()
 
+    def channel_stats_by_username(self) -> dict[str, int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT LOWER(channel_username) as uname, COUNT(*) as cnt FROM posts WHERE channel_username IS NOT NULL GROUP BY LOWER(channel_username)"
+            ).fetchall()
+        return {r["uname"]: r["cnt"] for r in rows}
+
     def save_post(
         self,
         channel_id: str,
