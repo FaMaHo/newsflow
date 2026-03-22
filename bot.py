@@ -1,21 +1,10 @@
 """
-Telegram News Aggregator Bot
-=============================
-Monitors public Telegram channels and forwards posts to your private channel.
-Supports /summary, /analyze, and /digest commands using Ollama (free, local AI).
-
-Requirements:
-    pip install telethon python-telegram-bot apscheduler aiohttp
-
-Setup:
-    1. Copy config.example.py → config.py and fill in your values
-    2. Run: python bot.py
+Newsflow — Telegram News Aggregator Bot
 """
 
 import asyncio
 import logging
 import os
-import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -41,7 +30,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("newsbot")
 
-# ── Railway deployment: restore session from environment variable ─────────────
+# ── Railway: restore Telegram session from env var ────────────────────────────
 _session_b64 = os.environ.get("SESSION_BASE64", "")
 _data_dir = os.environ.get("DATA_DIR", ".")
 if _session_b64:
@@ -51,36 +40,46 @@ if _session_b64:
     _session_path = os.path.join(_data_dir, "newsbot.session")
     if not os.path.exists(_session_path):
         _decoded = _b64.b64decode(_session_b64)
-        # Handle both compressed and uncompressed session files
         try:
             _decoded = _gzip.decompress(_decoded)
         except Exception:
-            pass  # not compressed, use as-is
+            pass
         with open(_session_path, "wb") as _f:
             _f.write(_decoded)
-
+        log.info("Session file restored from SESSION_BASE64")
 
 # ── Global instances ──────────────────────────────────────────────────────────
-
-db = Database(os.path.join(os.environ.get("DATA_DIR", "."), "newsbot.db"))
+db = Database(os.path.join(_data_dir, "newsbot.db"))
 ai = AIEngine(GROQ_API_KEY, GROQ_MODEL)
 telegram_bot: Optional[Bot] = None
 
 
-# ── Telethon listener (reads public channels) ─────────────────────────────────
+# ── Telethon listener ─────────────────────────────────────────────────────────
 
 async def start_channel_listener():
-    """
-    Uses a Telegram USER session (via Telethon) to monitor public channels.
-    On first run this will ask for your phone number and a login code.
-    The session is saved to 'newsbot.session' so you only log in once.
-    """
-    data_dir = os.environ.get("DATA_DIR", ".")
-    client = TelegramClient(os.path.join(data_dir, "newsbot"), API_ID, API_HASH)
+    session_path = os.path.join(_data_dir, "newsbot")
+    client = TelegramClient(session_path, API_ID, API_HASH)
     await client.start()
-    log.info("Telethon client started — monitoring %d channels", len(SOURCE_CHANNELS))
+    log.info("Telethon client connected")
 
-    @client.on(events.NewMessage(chats=SOURCE_CHANNELS))
+    # Resolve each channel explicitly and log the result
+    resolved = []
+    for ch in SOURCE_CHANNELS:
+        ch = ch.strip()
+        if not ch:
+            continue
+        try:
+            entity = await client.get_entity(ch)
+            resolved.append(entity)
+            log.info("✅ Resolved channel: %s → %s (id=%s)", ch, entity.title, entity.id)
+        except Exception as e:
+            log.error("❌ Could not resolve channel '%s': %s", ch, e)
+
+    if not resolved:
+        log.error("No channels could be resolved — bot will not forward any posts!")
+        return
+
+    @client.on(events.NewMessage(chats=resolved))
     async def on_new_post(event):
         message = event.message
         channel = event.chat
@@ -89,9 +88,8 @@ async def start_channel_listener():
 
         text = message.text or message.caption or ""
         if not text.strip():
-            return  # skip media-only posts with no caption
+            return
 
-        # Save to DB
         db.save_post(
             channel_id=str(event.chat_id),
             channel_name=channel_name,
@@ -100,28 +98,25 @@ async def start_channel_listener():
             text=text,
             timestamp=message.date,
         )
+        log.info("New post from %s (len=%d)", channel_name, len(text))
 
-        # Forward to your output channel with a source label
         source_link = f"https://t.me/{channel_username}/{message.id}" if channel_username else channel_name
         header = f"📡 <b>{channel_name}</b>\n"
         footer = f'\n\n<a href="{source_link}">→ Source</a>'
-
-        # Trim message if too long for Telegram
         max_body = 4096 - len(header) - len(footer) - 10
         body = text[:max_body] + ("…" if len(text) > max_body else "")
-
-        formatted = header + body + footer
 
         try:
             await telegram_bot.send_message(
                 chat_id=OUTPUT_CHANNEL_ID,
-                text=formatted,
+                text=header + body + footer,
                 parse_mode=constants.ParseMode.HTML,
                 disable_web_page_preview=True,
             )
         except Exception as e:
             log.error("Failed to forward post: %s", e)
 
+    log.info("Listening to %d channels", len(resolved))
     await client.run_until_disconnected()
 
 
@@ -129,8 +124,8 @@ async def start_channel_listener():
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "👋 <b>News Bot is running!</b>\n\n"
-        "Available commands:\n"
+        "👋 <b>Newsflow is running!</b>\n\n"
+        "Commands:\n"
         "  /summary [N] — Summarize last N posts (default 20)\n"
         "  /analyze [topic] — Compare how channels cover a topic\n"
         "  /digest — Full daily roundup\n"
@@ -171,69 +166,58 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             n = max(1, min(int(ctx.args[0]), 100))
         except ValueError:
             pass
-
     await update.message.reply_text(f"⏳ Summarizing last {n} posts…")
-
     posts = db.recent_posts(limit=n)
     if not posts:
-        await update.message.reply_text("No posts found yet. Wait for some to arrive!")
+        await update.message.reply_text("No posts yet — wait for channels to post something!")
         return
-
     summary = await ai.summarize(posts)
-
-    msg = f"📰 <b>Summary of last {len(posts)} posts</b>\n\n{summary}"
-    await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
+    await update.message.reply_text(
+        f"📰 <b>Summary of last {len(posts)} posts</b>\n\n{summary}",
+        parse_mode=constants.ParseMode.HTML
+    )
 
 
 async def cmd_analyze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     topic = " ".join(ctx.args) if ctx.args else None
-
     if topic:
-        await update.message.reply_text(f"🔍 Analyzing coverage of: <b>{topic}</b>…", parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text(f"🔍 Analyzing: <b>{topic}</b>…", parse_mode=constants.ParseMode.HTML)
         posts = db.posts_about(topic, limit=MAX_POSTS_FOR_ANALYSIS)
     else:
-        await update.message.reply_text("🔍 Analyzing recent coverage across channels…")
+        await update.message.reply_text("🔍 Analyzing recent coverage…")
         posts = db.recent_posts(limit=MAX_POSTS_FOR_ANALYSIS)
 
     if not posts:
-        await update.message.reply_text("Not enough posts to analyze. Try again later.")
+        await update.message.reply_text("No posts to analyze yet.")
         return
 
-    # Group posts by channel
     by_channel: dict[str, list[dict]] = {}
     for p in posts:
         by_channel.setdefault(p["channel_name"], []).append(p)
 
     if len(by_channel) < 2:
         await update.message.reply_text(
-            "Need posts from at least 2 channels to compare coverage.\n"
-            "More posts will arrive soon!"
+            f"Only have posts from {len(by_channel)} channel so far — need at least 2 to compare.\n"
+            "Try again once more channels have posted."
         )
         return
 
     analysis = await ai.analyze_coverage(by_channel, topic)
-
-    header = f"🧠 <b>Coverage analysis</b>"
+    header = "🧠 <b>Coverage analysis</b>"
     if topic:
         header += f" — <i>{topic}</i>"
     msg = f"{header}\n\n{analysis}"
 
-    # Split if too long
-    if len(msg) > 4000:
-        chunks = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
-        for chunk in chunks:
-            await update.message.reply_text(chunk, parse_mode=constants.ParseMode.HTML)
-    else:
-        await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
+    for chunk in [msg[i:i+4000] for i in range(0, len(msg), 4000)]:
+        await update.message.reply_text(chunk, parse_mode=constants.ParseMode.HTML)
 
 
 async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📋 Building your digest…")
+    await update.message.reply_text("📋 Building digest…")
     await send_daily_digest()
 
 
 async def send_daily_digest():
-    """Called by scheduler every day and also by /digest command."""
     since = datetime.utcnow() - timedelta(hours=24)
     posts = db.posts_since(since)
 
@@ -245,36 +229,24 @@ async def send_daily_digest():
         )
         return
 
-    # Stats header
     by_channel: dict[str, list] = {}
     for p in posts:
         by_channel.setdefault(p["channel_name"], []).append(p)
 
     stats_lines = [f"  • <b>{ch}</b>: {len(ps)} posts" for ch, ps in by_channel.items()]
-
     digest_text = await ai.daily_digest(posts)
-
     date_str = datetime.utcnow().strftime("%B %d, %Y")
+
     msg = (
         f"📋 <b>Daily Digest — {date_str}</b>\n"
         f"<i>{len(posts)} posts from {len(by_channel)} channels</i>\n\n"
-        + "\n".join(stats_lines)
-        + "\n\n"
-        + digest_text
+        + "\n".join(stats_lines) + "\n\n" + digest_text
     )
 
-    if len(msg) > 4000:
-        chunks = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
-        for chunk in chunks:
-            await telegram_bot.send_message(
-                chat_id=OUTPUT_CHANNEL_ID,
-                text=chunk,
-                parse_mode=constants.ParseMode.HTML,
-            )
-    else:
+    for chunk in [msg[i:i+4000] for i in range(0, len(msg), 4000)]:
         await telegram_bot.send_message(
             chat_id=OUTPUT_CHANNEL_ID,
-            text=msg,
+            text=chunk,
             parse_mode=constants.ParseMode.HTML,
         )
 
@@ -284,7 +256,6 @@ async def send_daily_digest():
 async def main():
     global telegram_bot
 
-    # Build the python-telegram-bot Application
     app = Application.builder().token(BOT_TOKEN).build()
     telegram_bot = app.bot
 
@@ -295,29 +266,19 @@ async def main():
     app.add_handler(CommandHandler("analyze",  cmd_analyze))
     app.add_handler(CommandHandler("digest",   cmd_digest))
 
-    # Daily digest scheduler
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        send_daily_digest,
-        trigger="cron",
-        hour=DIGEST_HOUR,
-        minute=DIGEST_MINUTE,
-    )
+    scheduler.add_job(send_daily_digest, trigger="cron", hour=DIGEST_HOUR, minute=DIGEST_MINUTE)
     scheduler.start()
 
-    # Manually manage the bot lifecycle so it plays nicely with asyncio.gather()
-    # (avoids the "event loop already running" conflict with run_polling)
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    log.info("Newsflow bot is running. Press Ctrl+C to stop.")
+    log.info("Newsflow bot is running")
 
     try:
-        # Run Telethon listener alongside the bot — both share the same event loop
         await start_channel_listener()
     finally:
-        # Clean shutdown on Ctrl+C or crash
         log.info("Shutting down...")
         await app.updater.stop()
         await app.stop()
